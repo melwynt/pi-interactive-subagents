@@ -57,12 +57,21 @@ import {
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 
-// Survive /reload: clear timers and abort poll loops from the previous module load.
-// /reload re-imports this file, giving fresh module-level state, but closures from
-// the old module keep running. See https://github.com/HazAT/pi-interactive-subagents/issues/5
+// Survive /reload: clear timers from the previous module load and ADOPT any
+// in-flight subagent watchers. /reload — and host-driven runner rebuilds, which
+// re-import extensions ~750ms after a tool call completes — re-import this file,
+// giving fresh module-level state, while closures from the old module keep
+// running. Stale timers must be cleared (issue #5), but in-flight watchers must
+// NOT be aborted: doing so killed every subagent spawned from host-driven
+// sessions with "Aborted while waiting for subagent to finish" before the
+// child finished booting. Watchers are therefore tracked in a registry shared
+// across module loads via Symbol.for keys, so a fresh module instance adopts
+// them.
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
-const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
+const RUNNING_MAP_KEY = Symbol.for("pi-subagents/running-map");
+const GENERATION_KEY = Symbol.for("pi-subagents/generation");
+const LATEST_PI_KEY = Symbol.for("pi-subagents/latest-pi");
 
 {
   const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
@@ -75,13 +84,30 @@ const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
     clearInterval(prevStatusInterval);
     (globalThis as any)[STATUS_INTERVAL_KEY] = null;
   }
-  const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-  if (prevAbort) prevAbort.abort();
-  (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+  // Bump the module generation. In-flight watchers compare their spawn-time
+  // generation against the current one to detect that they were started by a
+  // previous module load. This is only consulted by the orphan safety valve —
+  // healthy in-flight watchers are adopted, never aborted.
+  (globalThis as any)[GENERATION_KEY] =
+    (((globalThis as any)[GENERATION_KEY] as number | undefined) ?? 0) + 1;
 }
 
-function getModuleAbortSignal(): AbortSignal {
-  return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
+/**
+ * Current module generation. Incremented on every import of this module.
+ */
+function currentGeneration(): number {
+  return ((globalThis as any)[GENERATION_KEY] as number | undefined) ?? 1;
+}
+
+/**
+ * Resolve the ExtensionAPI to use for sending messages from background
+ * watchers. In-flight watchers close over the pi instance of the module that
+ * spawned them; after /reload the host invalidates that instance. The most
+ * recent instance is published on globalThis so adopted watchers deliver
+ * results through the current session.
+ */
+function piFor(fallback: ExtensionAPI): ExtensionAPI {
+  return ((globalThis as any)[LATEST_PI_KEY] as ExtensionAPI | undefined) ?? fallback;
 }
 
 const SubagentParams = Type.Object({
@@ -503,6 +529,13 @@ interface RunningSubagent {
     error?: string;
   };
   abortController?: AbortController;
+  /**
+   * Module generation that started this watcher's poll loop. Used only by the
+   * orphan safety valve: a watcher whose generation is stale AND whose surface
+   * no longer exists self-terminates instead of polling forever (issue #5).
+   * Undefined for watchers adopted from older module loads — never abort them.
+   */
+  generation?: number;
   cli?: string;
   sentinelFile?: string;
   statusState: SubagentStatusState;
@@ -515,8 +548,15 @@ interface RunningSubagent {
   interactive: boolean;
 }
 
-/** All currently running subagents, keyed by id. */
-const runningSubagents = new Map<string, RunningSubagent>();
+/**
+ * All currently running subagents, keyed by id.
+ *
+ * Stored on globalThis (keyed via Symbol.for) so the registry survives module
+ * re-imports: a fresh module load adopts in-flight watchers instead of losing
+ * track of them (and previously, killing them via the module abort controller).
+ */
+const runningSubagents: Map<string, RunningSubagent> = ((globalThis as any)[RUNNING_MAP_KEY] ??=
+  new Map<string, RunningSubagent>()) as Map<string, RunningSubagent>;
 
 // ── Widget management ──
 
@@ -624,28 +664,35 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
 function updateWidget() {
   if (!latestCtx?.hasUI) return;
 
-  if (runningSubagents.size === 0) {
-    latestCtx.ui.setWidget("subagent-status", undefined);
-    if (widgetInterval) {
-      clearInterval(widgetInterval);
-      widgetInterval = null;
-      (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+  // latestCtx can be stale after a session reload (adopted watchers from the
+  // previous module load still call this). Widget updates are cosmetic — never
+  // let them break result delivery.
+  try {
+    if (runningSubagents.size === 0) {
+      latestCtx.ui.setWidget("subagent-status", undefined);
+      if (widgetInterval) {
+        clearInterval(widgetInterval);
+        widgetInterval = null;
+        (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+      }
+      return;
     }
-    return;
-  }
 
-  latestCtx.ui.setWidget(
-    "subagent-status",
-    (_tui: any, _theme: any) => {
-      return {
-        invalidate() {},
-        render(width: number) {
-          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width);
-        },
-      };
-    },
-    { placement: "aboveEditor" },
-  );
+    latestCtx.ui.setWidget(
+      "subagent-status",
+      (_tui: any, _theme: any) => {
+        return {
+          invalidate() {},
+          render(width: number) {
+            return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width);
+          },
+        };
+      },
+      { placement: "aboveEditor" },
+    );
+  } catch {
+    // Stale UI context — the fresh module instance owns the widget now.
+  }
 }
 
 /**
@@ -912,6 +959,8 @@ export const __test__ = {
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,
+  currentGeneration,
+  shouldAbortOrphanedWatcher,
   formatElapsed,
 };
 
@@ -1243,6 +1292,34 @@ function copyClaudeSession(sentinelFile: string): string | null {
   }
 }
 
+/**
+ * Orphan safety valve (issue #5 regression guard). After a module re-import, a
+ * watcher left over from a previous module load whose surface (pane) no longer
+ * exists would otherwise poll forever. Self-terminate in that case — and only
+ * in that case: healthy in-flight watchers survive re-imports and are adopted
+ * by the fresh module instance.
+ */
+const ORPHAN_SURFACE_FAILURE_THRESHOLD = 3;
+
+function shouldAbortOrphanedWatcher(
+  running: Pick<RunningSubagent, "generation">,
+  consecutiveSurfaceFailures: number,
+): boolean {
+  if (running.generation === undefined) return false;
+  if (running.generation === currentGeneration()) return false;
+  return consecutiveSurfaceFailures >= ORPHAN_SURFACE_FAILURE_THRESHOLD;
+}
+
+function maybeAbortOrphanedWatcher(
+  running: RunningSubagent,
+  signal: AbortSignal,
+  consecutiveSurfaceFailures: number,
+): void {
+  if (signal.aborted) return;
+  if (!shouldAbortOrphanedWatcher(running, consecutiveSurfaceFailures)) return;
+  running.abortController?.abort();
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -1250,12 +1327,27 @@ async function watchSubagent(
   const { name, task, surface, startTime, sessionFile } = running;
 
   try {
-    const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
+    // Poll with this watcher's own signal only. The previous module-wide abort
+    // controller killed in-flight watchers whenever the module was re-imported
+    // — which happens ~750ms after a tool call completes in host-driven
+    // sessions, long before the child finishes booting. Watcher lifetime is
+    // governed by its own controller (explicit cancellation, session_shutdown)
+    // plus the orphan safety valve below.
+    running.generation ??= currentGeneration();
+    let consecutiveSurfaceFailures = 0;
+    const result = await pollForExit(surface, signal, {
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
+      onSurfaceReadSuccess() {
+        consecutiveSurfaceFailures = 0;
+      },
+      onSurfaceReadFailure() {
+        consecutiveSurfaceFailures++;
+      },
       onTick() {
         observeRunningSubagent(running);
+        maybeAbortOrphanedWatcher(running, signal, consecutiveSurfaceFailures);
       },
     });
 
@@ -1358,13 +1450,18 @@ async function watchSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  // Publish this pi instance so watchers adopted from a previous module load
+  // can deliver results through the current session (piFor) after /reload
+  // invalidated their captured instance.
+  (globalThis as any)[LATEST_PI_KEY] = pi;
+
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
   });
 
   // Clean up on session shutdown
-  pi.on("session_shutdown", (_event, _ctx) => {
+  pi.on("session_shutdown", (event, _ctx) => {
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -1375,13 +1472,27 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       statusInterval = null;
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
-    const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-    if (moduleAbort) moduleAbort.abort();
+    // /reload re-imports the extension; in-flight watchers are adopted by the
+    // fresh module instance (see the module-init block and the running map on
+    // globalThis) and keep running, delivering results into the reloaded
+    // session. Any other shutdown reason ends the session — cancel all
+    // watchers.
+    const reason = (event as any)?.reason;
+    if (reason === "reload") return;
     for (const [_id, agent] of runningSubagents) {
       agent.abortController?.abort();
     }
     runningSubagents.clear();
   });
+
+  // Adopt in-flight subagents from a previous module load (host-driven runner
+  // rebuild or /reload). Their watchers keep running in old-module closures;
+  // re-arm widget + status supervision so this module instance tracks them.
+  // (The module-init block already cleared the previous module's timers.)
+  if (runningSubagents.size > 0) {
+    startWidgetRefresh();
+    startStatusRefresh(pi);
+  }
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
   const deniedTools = new Set(
@@ -1466,7 +1577,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             if (result.ping) {
               // Subagent is requesting help — steer a ping message with session path for resume
               const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
-              pi.sendMessage(
+              piFor(pi).sendMessage(
                 {
                   customType: "subagent_ping",
                   content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
@@ -1485,7 +1596,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
             const presentation = resolveResultPresentation(result, running.name);
 
-            pi.sendMessage(
+            piFor(pi).sendMessage(
               {
                 customType: "subagent_result",
                 content: presentation,
@@ -1506,7 +1617,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           })
           .catch((err) => {
             updateWidget();
-            pi.sendMessage(
+            piFor(pi).sendMessage(
               {
                 customType: "subagent_result",
                 content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
@@ -1892,7 +2003,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
             if (result.ping) {
               const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
-              pi.sendMessage(
+              piFor(pi).sendMessage(
                 {
                   customType: "subagent_ping",
                   content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
@@ -1920,7 +2031,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               name,
             );
 
-            pi.sendMessage(
+            piFor(pi).sendMessage(
               {
                 customType: "subagent_result",
                 content: presentation,
@@ -1939,7 +2050,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           })
           .catch((err) => {
             updateWidget();
-            pi.sendMessage(
+            piFor(pi).sendMessage(
               {
                 customType: "subagent_result",
                 content: `Resume error: ${err?.message ?? String(err)}`,

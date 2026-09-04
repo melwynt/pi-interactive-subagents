@@ -1890,6 +1890,98 @@ describe("subagent interruption", () => {
   });
 });
 
+describe("watcher adoption across module re-imports", () => {
+  const RUNNING_MAP_KEY = Symbol.for("pi-subagents/running-map");
+  const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
+  const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
+  const extensionUrl = new URL("../pi-extension/subagents/index.ts", import.meta.url).href;
+
+  it("shares the running-subagents registry across module loads", async () => {
+    const mod1 = await import(`${extensionUrl}?adoption=shared-1`);
+    const mod2 = await import(`${extensionUrl}?adoption=shared-2`);
+
+    const map1 = mod1.__test__.runningSubagents as Map<string, unknown>;
+    const map2 = mod2.__test__.runningSubagents as Map<string, unknown>;
+
+    assert.equal(map1, map2, "distinct module loads must see the same registry");
+    assert.equal((globalThis as any)[RUNNING_MAP_KEY], map1);
+  });
+
+  it("does not abort in-flight watchers on module re-import", async () => {
+    const mod1 = await import(`${extensionUrl}?adoption=abort-1`);
+    const controller = new AbortController();
+    const running = {
+      id: "adopt-1",
+      abortController: controller,
+      generation: mod1.__test__.currentGeneration(),
+    };
+    (mod1.__test__.runningSubagents as Map<string, unknown>).set("adopt-1", running);
+
+    try {
+      const generationBefore = mod1.__test__.currentGeneration();
+      const mod2 = await import(`${extensionUrl}?adoption=abort-2`);
+
+      // A fresh module load must not kill watchers started milliseconds earlier
+      // (the v3.1.0 abort-on-import behavior that broke host-driven sessions).
+      assert.equal(controller.signal.aborted, false);
+      assert.equal(mod2.__test__.currentGeneration(), generationBefore + 1);
+      assert.equal(
+        (mod2.__test__.runningSubagents as Map<string, unknown>).has("adopt-1"),
+        true,
+        "the fresh module load must adopt the in-flight watcher",
+      );
+    } finally {
+      (mod1.__test__.runningSubagents as Map<string, unknown>).delete("adopt-1");
+    }
+  });
+
+  it("clears the previous module load's widget/status timers on re-import (#5)", async () => {
+    const widgetTimer = setInterval(() => {}, 60_000);
+    const statusTimer = setInterval(() => {}, 60_000);
+    (globalThis as any)[WIDGET_INTERVAL_KEY] = widgetTimer;
+    (globalThis as any)[STATUS_INTERVAL_KEY] = statusTimer;
+
+    const cleared: unknown[] = [];
+    const originalClearInterval = globalThis.clearInterval;
+    globalThis.clearInterval = ((id: unknown) => {
+      cleared.push(id);
+    }) as typeof clearInterval;
+    try {
+      await import(`${extensionUrl}?adoption=timers-1`);
+    } finally {
+      globalThis.clearInterval = originalClearInterval;
+      originalClearInterval(widgetTimer);
+      originalClearInterval(statusTimer);
+    }
+
+    assert.ok(cleared.includes(widgetTimer), "stale widget timer must be cleared");
+    assert.ok(cleared.includes(statusTimer), "stale status timer must be cleared");
+    assert.equal((globalThis as any)[WIDGET_INTERVAL_KEY], null);
+    assert.equal((globalThis as any)[STATUS_INTERVAL_KEY], null);
+  });
+});
+
+describe("orphan safety valve", () => {
+  it("self-terminates only stale-generation watchers with an unreadable surface", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const generation = testApi.currentGeneration();
+    const freshGeneration = { generation };
+    const staleGeneration = { generation: generation - 1 };
+    const unversioned = {};
+
+    // Healthy in-flight watcher: current generation — never abort, even if the
+    // surface read is failing (pane may be booting).
+    assert.equal(testApi.shouldAbortOrphanedWatcher(freshGeneration, 99), false);
+    // Watcher adopted from an older module load: abort only once the surface
+    // has been unreadable for several consecutive polls.
+    assert.equal(testApi.shouldAbortOrphanedWatcher(staleGeneration, 0), false);
+    assert.equal(testApi.shouldAbortOrphanedWatcher(staleGeneration, 2), false);
+    assert.equal(testApi.shouldAbortOrphanedWatcher(staleGeneration, 3), true);
+    // Watchers without a generation (pre-upgrade) are adopted, never aborted.
+    assert.equal(testApi.shouldAbortOrphanedWatcher(unversioned, 99), false);
+  });
+});
+
 describe("subagent status renderer", () => {
   function createTheme() {
     return {

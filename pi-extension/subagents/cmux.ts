@@ -1264,6 +1264,10 @@ export async function pollForExit(
     sessionFile?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
+    /** Called when a surface read succeeded (resets orphan-failure counting). */
+    onSurfaceReadSuccess?: () => void;
+    /** Called when a surface read failed — the surface may no longer exist. */
+    onSurfaceReadFailure?: () => void;
   },
 ): Promise<PollResult> {
   const start = Date.now();
@@ -1297,11 +1301,13 @@ export async function pollForExit(
     // Slow path: read terminal screen for sentinel (crash detection)
     try {
       const screen = await readScreenAsync(surface, 5);
+      options.onSurfaceReadSuccess?.();
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
     } catch {
+      options.onSurfaceReadFailure?.();
       // Surface may have been destroyed — check if .exit file appeared in the meantime
       if (options.sessionFile) {
         try {
