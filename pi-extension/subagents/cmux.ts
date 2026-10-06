@@ -1194,7 +1194,12 @@ export function closeSurface(surface: string): void {
   const backend = requireMuxBackend();
 
   if (backend === "cmux") {
-    execSync(`cmux close-surface --surface ${shellEscape(surface)}`, {
+    // The subagent pane's interactive shell outlives the agent script, so a
+    // plain close is refused with "confirmation_required: Surface has a
+    // running process". The result is always extracted before closing, and
+    // only auto-exit subagent panes reach this path, so force-closing the
+    // leftover shell is the intended behavior.
+    execSync(`cmux close-surface --surface ${shellEscape(surface)} --force`, {
       encoding: "utf8",
     });
     return;

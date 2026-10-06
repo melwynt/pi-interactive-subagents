@@ -1383,7 +1383,10 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      // Best-effort: a failed close must never clobber the extracted result.
+      try {
+        closeSurface(surface);
+      } catch {}
       runningSubagents.delete(running.id);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
@@ -1408,7 +1411,11 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    closeSurface(surface);
+    // Best-effort: a failed close must never clobber the extracted result
+    // (the pane may linger, but the summary is what the orchestrator needs).
+    try {
+      closeSurface(surface);
+    } catch {}
     runningSubagents.delete(running.id);
 
     return {
